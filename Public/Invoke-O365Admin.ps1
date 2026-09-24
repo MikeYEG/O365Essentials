@@ -5,6 +5,10 @@
 
     .DESCRIPTION
     This function is responsible for sending requests to the Office 365 API for administrative tasks.
+    It selects the correct cached token headers for each backend, supports cookie-backed
+    admin.cloud.microsoft portal replay, and performs a one-time hidden reconnect when a
+    portal-sensitive route responds with HTTP 440 and portal attachment state can be
+    folded into Connect-O365Admin.
 
     .PARAMETER Uri
     The URI endpoint for the API request.
@@ -23,6 +27,25 @@
 
     .PARAMETER QueryParameter
     The query parameters for the request.
+
+    .PARAMETER RequiredGraphScope
+    Delegated Microsoft Graph scopes required by the target Graph endpoint. When the
+    cached Graph token does not include them and the current authentication state can
+    be refreshed, Invoke-O365Admin reconnects with those scopes before sending the
+    request.
+
+    .PARAMETER JsonDepth
+    Depth used when serializing request bodies. Leave the default for normal API
+    calls and raise it only for known full-settings payloads with deeper nested
+    objects.
+
+    .PARAMETER UsePortalSession
+    Forces the request through the cached admin.cloud.microsoft portal WebSession
+    attached to the current authorization state.
+
+    .PARAMETER QuietOnError
+    Suppresses warning noise for expected tenant-specific or portal-sensitive failures so
+    callers can convert them into structured unavailable results.
     #>
     [cmdletBinding(SupportsShouldProcess)]
     param(
@@ -30,15 +53,41 @@
         [alias('Authorization')][System.Collections.IDictionary] $Headers,
         [validateset('GET', 'DELETE', 'POST', 'PATCH', 'PUT')][string] $Method = 'GET',
         [string] $ContentType = "application/json; charset=UTF-8",
-        [System.Collections.IDictionary] $Body,
-        [System.Collections.IDictionary] $QueryParameter
+        [object] $Body,
+        [System.Collections.IDictionary] $QueryParameter,
+        [System.Collections.IDictionary] $AdditionalHeaders,
+        [string[]] $RequiredGraphScope,
+        [ValidateRange(1, 100)][int] $JsonDepth = 5,
+        [switch] $UsePortalSession,
+        [switch] $QuietOnError,
+        [Parameter(DontShow)][switch] $SkipPortalAttachRetry
     )
+
     if (-not $Headers -and $Script:AuthorizationO365Cache) {
+        $Headers = $Script:AuthorizationO365Cache
+    }
+    $CallerHeaders = if ($PSBoundParameters.ContainsKey('Headers') -and $Headers) { $Headers } else { $null }
+
+    $PortalSessionRequest = $false
+    if ($UsePortalSession -and $Uri -like '*admin.cloud.microsoft*' -and $Headers -and $Headers.Contains('PortalWebSession') -and $Headers.PortalWebSession) {
+        $PortalSessionRequest = $true
+    }
+
+    if (-not $PortalSessionRequest -and -not $Headers -and $Script:AuthorizationO365Cache) {
         # This forces a reconnect of session in case it's about to time out. If it's not timeouting a cache value is used
         $Headers = Connect-O365Admin -Headers $Headers
-    } elseif ($Headers) {
-        $Headers = Connect-O365Admin -Headers $Headers
-    } else {
+    } elseif (-not $PortalSessionRequest -and $Headers) {
+        $RefreshedHeaders = Connect-O365Admin -Headers $Headers
+        if ($RefreshedHeaders) {
+            $Headers = $RefreshedHeaders
+            Update-AuthorizationState -Target $CallerHeaders -Source $RefreshedHeaders
+            if ($CallerHeaders) {
+                $Headers = $CallerHeaders
+            }
+        } else {
+            $Headers = $null
+        }
+    } elseif (-not $Headers) {
         Write-Warning "Invoke-O365Admin - Not connected. Please connect using Connect-O365Admin."
         return
     }
@@ -46,19 +95,59 @@
         Write-Warning "Invoke-O365Admin - Authorization error. Skipping."
         return
     }
+
+    if ($Uri -like '*graph.microsoft.com*' -and $RequiredGraphScope -and -not (Test-O365GraphScope -GrantedScope $Headers.GraphScopes -RequiredScope $RequiredGraphScope)) {
+        $CanRefreshGraphScope = $Headers.AuthenticationMode -eq 'WAM' -or $Headers.RefreshToken -or $Headers.Credential
+        if ($CanRefreshGraphScope) {
+            Write-Verbose -Message "Invoke-O365Admin - Refreshing Graph token with required scopes: $($RequiredGraphScope -join ', ')"
+            $RefreshedHeaders = Connect-O365Admin -Headers $Headers -ForceRefresh -GraphScope $RequiredGraphScope -SuppressWamPrompt
+            if (-not $RefreshedHeaders) {
+                Write-Warning "Invoke-O365Admin - Authorization error after Graph scope refresh. Skipping."
+                return
+            }
+            $Headers = $RefreshedHeaders
+            $GraphRefreshKeys = 'AccessTokenGraph', 'HeadersGraph', 'GraphScopes', 'RefreshToken', 'Tenant', 'UserName', 'AuthenticationMode'
+            Update-AuthorizationState -Target $CallerHeaders -Source $RefreshedHeaders -Key $GraphRefreshKeys
+            if ($CallerHeaders) {
+                $Script:AuthorizationO365Cache = $CallerHeaders
+                $Headers = $CallerHeaders
+            }
+        } else {
+            Write-Verbose -Message "Invoke-O365Admin - Required Graph scopes were not present and the current authentication mode cannot be refreshed automatically: $($RequiredGraphScope -join ', ')"
+        }
+    }
+
     $RestSplat = @{
         Method      = $Method
         ContentType = $ContentType
     }
-    if ($Uri -like '*admin.microsoft.com*') {
+    if ($PortalSessionRequest) {
+        $RestSplat['Headers'] = if ($Headers.Contains('HeadersPortal') -and $Headers.HeadersPortal) { $Headers.HeadersPortal } else { @{} }
+        $RestSplat['WebSession'] = $Headers.PortalWebSession
+    } elseif ($Uri -like '*admin.microsoft.com*' -or $Uri -like '*admin.cloud.microsoft*') {
         $RestSplat['Headers'] = $Headers.HeadersO365
     } elseif ($Uri -like '*graph.microsoft.com*') {
         $RestSplat['Headers'] = $Headers.HeadersGraph
+    } elseif ($Uri -like '*management.azure.com*') {
+        $RestSplat['Headers'] = if ($Headers.HeadersARM) { $Headers.HeadersARM } else { $Headers.HeadersAzure }
+    } elseif ($Uri -like '*teams.microsoft.com*') {
+        $RestSplat['Headers'] = if ($Headers.HeadersTeams) { $Headers.HeadersTeams } else { $Headers.HeadersO365 }
     } else {
-        $RestSplat['Headers'] = $Headers.HeadersAzure
+        $RestSplat['Headers'] = if ($Headers.HeadersAzure) { $Headers.HeadersAzure } else { $Headers.HeadersARM }
     }
 
-    if ($PSVersionTable.PSVersion.Major -eq 5) {
+    if ($AdditionalHeaders) {
+        $MergedHeaders = [ordered] @{}
+        foreach ($Key in $RestSplat['Headers'].Keys) {
+            $MergedHeaders[$Key] = $RestSplat['Headers'][$Key]
+        }
+        foreach ($Key in $AdditionalHeaders.Keys) {
+            $MergedHeaders[$Key] = $AdditionalHeaders[$Key]
+        }
+        $RestSplat['Headers'] = $MergedHeaders
+    }
+
+    if ($PSVersionTable.PSVersion.Major -eq 5 -and -not $RestSplat.ContainsKey('WebSession')) {
         $CookieContainer = [System.Net.CookieContainer]::new()
         $CookieContainer.MaxCookieSize = 1048576
 
@@ -85,7 +174,7 @@
     #$RestSplat.Headers."etag" = '1629993527.826253_3ce8143d'
 
     if ($Body) {
-        $RestSplat['Body'] = $Body | ConvertTo-Json -Depth 5
+        $RestSplat['Body'] = $Body | ConvertTo-Json -Depth $JsonDepth
     }
     $RestSplat.Uri = Join-UriQuery -BaseUri $Uri -QueryParameter $QueryParameter
     if ($RestSplat['Body']) {
@@ -102,9 +191,13 @@
                 if ($OutputQuery -is [bool]) {
                     $OutputQuery
                 } elseif ($OutputQuery -is [array]) {
-                    $Properties = $OutputQuery | Select-Properties -ExcludeProperty '@odata.context', '@odata.id', '@odata.type', 'Length' -WarningAction SilentlyContinue -WarningVariable varWarning
-                    if (-not $varWarning) {
-                        $OutputQuery | Select-Object -Property $Properties
+                    if ($OutputQuery.Count -eq 0) {
+                        Write-Output -NoEnumerate $OutputQuery
+                    } else {
+                        $Properties = $OutputQuery | Select-Properties -ExcludeProperty '@odata.context', '@odata.id', '@odata.type', 'Length' -WarningAction SilentlyContinue -WarningVariable varWarning
+                        if (-not $varWarning) {
+                            $OutputQuery | Select-Object -Property $Properties
+                        }
                     }
                 } elseif ($OutputQuery -is [string]) {
                     if ($OutputQuery) {
@@ -115,9 +208,13 @@
                     }
                 } elseif ($OutputQuery -is [PSCustomObject]) {
                     if ($OutputQuery.PSObject.Properties.Name -contains 'value') {
-                        $Properties = $OutputQuery.value | Select-Properties -ExcludeProperty '@odata.context', '@odata.id', '@odata.type', 'Length' -WarningAction SilentlyContinue -WarningVariable varWarning
-                        if (-not $varWarning) {
-                            $OutputQuery.value | Select-Object -Property $Properties
+                        if ($OutputQuery.value -is [array] -and $OutputQuery.value.Count -eq 0) {
+                            Write-Output -NoEnumerate $OutputQuery.value
+                        } else {
+                            $Properties = $OutputQuery.value | Select-Properties -ExcludeProperty '@odata.context', '@odata.id', '@odata.type', 'Length' -WarningAction SilentlyContinue -WarningVariable varWarning
+                            if (-not $varWarning) {
+                                $OutputQuery.value | Select-Object -Property $Properties
+                            }
                         }
                     } else {
                         $Properties = $OutputQuery | Select-Properties -ExcludeProperty '@odata.context', '@odata.id', '@odata.type', 'Length' -WarningAction SilentlyContinue -WarningVariable varWarning
@@ -131,8 +228,13 @@
                 }
             }
             if ($OutputQuery -isnot [array]) {
-                if ($OutputQuery.'@odata.nextLink') {
-                    $RestSplat.Uri = $OutputQuery.'@odata.nextLink'
+                $NextLink = if ($OutputQuery.'@odata.nextLink') {
+                    $OutputQuery.'@odata.nextLink'
+                } elseif ($OutputQuery.nextLink) {
+                    $OutputQuery.nextLink
+                }
+                if ($NextLink) {
+                    $RestSplat.Uri = $NextLink
                     if ($RestSplat.Uri) {
                         # We must remove websession parameter because Invoke-o365admin doesn't have it and i don't want to add it to the code
                         # it will set it self anyways
@@ -141,7 +243,7 @@
                         $RestSplat.Headers = $Headers
                         # Not sure if this is best/fastest way to do it, but it works
                         # It's a bit better than saving it to variable and releasing everything later on as it can be used in pipeline
-                        Invoke-O365Admin @RestSplat | ForEach-Object { if ($null -ne $_) { $_ } }
+                        Invoke-O365Admin @RestSplat -ErrorAction $ErrorActionPreference | ForEach-Object { if ($null -ne $_) { $_ } }
                         #if ($null -ne $MoreData) {
                         #    $MoreData
                         #}
@@ -163,6 +265,48 @@
             }
         }
     } catch {
+        $CanRetryWithPortalAttach = -not $SkipPortalAttachRetry -and
+            -not $PortalSessionRequest -and
+            $Uri -like '*admin.cloud.microsoft*' -and
+            $Headers -and
+            $_.Exception.Message -match '\b440\b'
+
+        if ($CanRetryWithPortalAttach) {
+            # Some admin.cloud.microsoft routes succeed only after a hidden host-provided
+            # portal attachment has been folded into the current Connect-O365Admin state.
+            $RetriedHeaders = Connect-O365Admin -Headers $Headers
+            $HasPortalRetryState = $RetriedHeaders -and
+                $RetriedHeaders.Contains('PortalWebSession') -and
+                $null -ne $RetriedHeaders.PortalWebSession
+
+            if ($HasPortalRetryState) {
+                $RetrySplat = @{
+                    Uri                  = $Uri
+                    Headers              = $RetriedHeaders
+                    Method               = $Method
+                    ContentType          = $ContentType
+                    QueryParameter       = $QueryParameter
+                    AdditionalHeaders     = $AdditionalHeaders
+                    RequiredGraphScope    = $RequiredGraphScope
+                    JsonDepth             = $JsonDepth
+                    UsePortalSession      = $true
+                    QuietOnError          = $QuietOnError
+                    SkipPortalAttachRetry = $true
+                }
+                if ($PSBoundParameters.ContainsKey('Body')) {
+                    $RetrySplat['Body'] = $Body
+                }
+
+                return Invoke-O365Admin @RetrySplat -ErrorAction $ErrorActionPreference
+            }
+        }
+
+        if ($QuietOnError) {
+            if ($Method -notin 'GET', 'POST') {
+                return $false
+            }
+            return
+        }
         if ($PSBoundParameters.ErrorAction -eq 'Stop') {
             Write-Error $_
             return

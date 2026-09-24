@@ -1,4 +1,27 @@
 function Connect-O365Admin {
+    <#
+    .SYNOPSIS
+    Connects to Microsoft 365 admin workloads used by O365Essentials.
+
+    .DESCRIPTION
+    Creates or refreshes the shared O365Essentials authorization cache used by the
+    module's Graph, ARM, Teams, and admin center readers.
+
+    For normal users this remains the only public connection command. Host apps can
+    transparently attach an existing admin.cloud.microsoft portal session by supplying
+    hidden portal artifacts through the hidden PortalAttach* parameters or the
+    process-scoped O365ESSENTIALS_PORTAL_* environment variables consumed by
+    Get-O365PortalAttachmentContext.
+
+    When portal attachment state is present, Connect-O365Admin folds that browser-backed
+    session into the cached authorization object so portal-sensitive routes can later
+    replay through Invoke-O365Admin without changing the user-facing workflow.
+
+    .PARAMETER GraphScope
+    Additional delegated Microsoft Graph scopes to request for Graph-backed commands
+    that need more than the default Graph token. This is especially useful with
+    -UseWam because MSAL can prompt for the required delegated consent interactively.
+    #>
     [cmdletbinding(DefaultParameterSetName = 'Credential')]
     param(
         [parameter(ParameterSetName = 'Credential')][PSCredential] $Credential,
@@ -11,15 +34,78 @@ function Connect-O365Admin {
         [int] $ExpiresTimeout = 30,
         [switch] $ForceRefresh,
         [switch] $Device,
+        [parameter(ParameterSetName = 'Credential')][alias('WAM')][switch] $UseWam,
         # Tenant ID; defaults to 'organizations' and is replaced with the actual tenant after sign-in
         [alias('TenantID')][string] $Tenant,
+        [alias('GraphScopes')][string[]] $GraphScope,
         [string] $DomainName,
-        [string] $Subscription
+        [string] $Subscription,
+        # Hidden portal attachment inputs are intended for host/app integrations only.
+        # End users should still call Connect-O365Admin the same way as before.
+        [Parameter(DontShow)][Microsoft.PowerShell.Commands.WebRequestSession] $PortalAttachWebSession,
+        [Parameter(DontShow)][string] $PortalAttachRootAuthToken,
+        [Parameter(DontShow)][string] $PortalAttachSPAAuthCookie,
+        [Parameter(DontShow)][string] $PortalAttachOIDCAuthCookie,
+        [Parameter(DontShow)][string] $PortalAttachAjaxSessionKey,
+        [Parameter(DontShow)][string] $PortalAttachSessionId,
+        [Parameter(DontShow)][string] $PortalAttachTenantId,
+        [Parameter(DontShow)][string] $PortalAttachRouteKey,
+        [Parameter(DontShow)][string] $PortalAttachUserName,
+        [Parameter(DontShow)][System.Collections.IDictionary] $PortalAttachCookieMap,
+        [Parameter(DontShow)][switch] $SkipPortalBootstrap,
+        [Parameter(DontShow)][switch] $SuppressWamPrompt
     )
 
+    $HasPortalAttachInput = $PSBoundParameters.ContainsKey('PortalAttachWebSession') -or
+        $PSBoundParameters.ContainsKey('PortalAttachRootAuthToken') -or
+        $PSBoundParameters.ContainsKey('PortalAttachSPAAuthCookie') -or
+        $PSBoundParameters.ContainsKey('PortalAttachOIDCAuthCookie') -or
+        $PSBoundParameters.ContainsKey('PortalAttachAjaxSessionKey') -or
+        $PSBoundParameters.ContainsKey('PortalAttachSessionId') -or
+        $PSBoundParameters.ContainsKey('PortalAttachTenantId') -or
+        $PSBoundParameters.ContainsKey('PortalAttachRouteKey') -or
+        $PSBoundParameters.ContainsKey('PortalAttachUserName') -or
+        $PSBoundParameters.ContainsKey('PortalAttachCookieMap')
+    $UsePortalAttachWebSession = $PSBoundParameters.ContainsKey('PortalAttachWebSession')
+    $UsePortalAttachCookies = $PSBoundParameters.ContainsKey('PortalAttachRootAuthToken')
+
+    if (-not $HasPortalAttachInput) {
+        $PortalAttachmentContext = Get-O365PortalAttachmentContext
+        if ($PortalAttachmentContext) {
+            $PortalAttachRootAuthToken = $PortalAttachmentContext.RootAuthToken
+            $PortalAttachSPAAuthCookie = $PortalAttachmentContext.SPAAuthCookie
+            $PortalAttachOIDCAuthCookie = $PortalAttachmentContext.OIDCAuthCookie
+            $PortalAttachAjaxSessionKey = $PortalAttachmentContext.AjaxSessionKey
+            $PortalAttachSessionId = $PortalAttachmentContext.SessionId
+            $PortalAttachTenantId = $PortalAttachmentContext.TenantId
+            $PortalAttachRouteKey = $PortalAttachmentContext.PortalRouteKey
+            $PortalAttachUserName = $PortalAttachmentContext.Username
+            $PortalAttachCookieMap = $PortalAttachmentContext.CookieMap
+            if ($PortalAttachmentContext.SkipBootstrap) {
+                $SkipPortalBootstrap = $true
+            }
+            $HasPortalAttachInput = $true
+            $UsePortalAttachCookies = $true
+        }
+    }
+
     $RefreshToken = $null
+    $PortalWebSession = $null
+    $AjaxSessionKey = $null
+    $PortalRouteKey = $null
+    $PortalUserId = $null
+    $PortalTenantId = $null
+    $HeadersPortal = $null
+    $RequestedUseWam = [bool] $UseWam
+    $ExplicitCredential = if ($PSBoundParameters.ContainsKey('Credential')) { $Credential } else { $null }
+    $CachedAuthenticationMode = $null
+    $CachedUserName = $null
+    $RequestedGraphScopes = @($GraphScope | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+    $ExistingGraphScopes = @()
     if ($Headers) {
-        if ($Headers.ExpiresOnUTC -gt [datetime]::UtcNow -and -not $ForceRefresh) {
+        $ExistingGraphScopes = @($Headers.GraphScopes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+        $HasRequestedGraphScopes = $RequestedGraphScopes.Count -eq 0 -or (Test-O365GraphScope -GrantedScope $Headers.GraphScopes -RequiredScope $RequestedGraphScopes)
+        if ($Headers.ExpiresOnUTC -gt [datetime]::UtcNow -and -not $ForceRefresh -and -not $HasPortalAttachInput -and $HasRequestedGraphScopes) {
             Write-Verbose -Message "Connect-O365Admin - Using cache for connection $($Headers.UserName)"
             return $Headers
         } else {
@@ -31,9 +117,22 @@ function Connect-O365Admin {
             $Tenant = $Headers.Tenant
             $Subscription = $Headers.Subscription
             $RefreshToken = $Headers.RefreshToken
+            if ($Headers.Contains('AuthenticationMode')) { $CachedAuthenticationMode = $Headers.AuthenticationMode }
+            if ($Headers.Contains('UserName')) { $CachedUserName = $Headers.UserName }
+            if (-not $RequestedUseWam) {
+                $UseWam = $CachedAuthenticationMode -eq 'WAM'
+            }
+            if ($Headers.Contains('PortalWebSession')) { $PortalWebSession = $Headers.PortalWebSession }
+            if ($Headers.Contains('AjaxSessionKey')) { $AjaxSessionKey = $Headers.AjaxSessionKey }
+            if ($Headers.Contains('PortalRouteKey')) { $PortalRouteKey = $Headers.PortalRouteKey }
+            if ($Headers.Contains('PortalUserId')) { $PortalUserId = $Headers.PortalUserId }
+            if ($Headers.Contains('PortalTenantId')) { $PortalTenantId = $Headers.PortalTenantId }
+            if ($Headers.Contains('HeadersPortal')) { $HeadersPortal = $Headers.HeadersPortal }
         }
     } elseif ($Script:AuthorizationO365Cache) {
-        if ($Script:AuthorizationO365Cache.ExpiresOnUTC -gt [datetime]::UtcNow -and -not $ForceRefresh) {
+        $ExistingGraphScopes = @($Script:AuthorizationO365Cache.GraphScopes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+        $HasRequestedGraphScopes = $RequestedGraphScopes.Count -eq 0 -or (Test-O365GraphScope -GrantedScope $Script:AuthorizationO365Cache.GraphScopes -RequiredScope $RequestedGraphScopes)
+        if ($Script:AuthorizationO365Cache.ExpiresOnUTC -gt [datetime]::UtcNow -and -not $ForceRefresh -and -not $HasPortalAttachInput -and $HasRequestedGraphScopes) {
             Write-Verbose -Message "Connect-O365Admin - Using cache for connection $($Script:AuthorizationO365Cache.UserName)"
             return $Script:AuthorizationO365Cache
         } else {
@@ -45,6 +144,88 @@ function Connect-O365Admin {
             $Tenant = $Script:AuthorizationO365Cache.Tenant
             $Subscription = $Script:AuthorizationO365Cache.Subscription
             $RefreshToken = $Script:AuthorizationO365Cache.RefreshToken
+            if ($Script:AuthorizationO365Cache.Contains('AuthenticationMode')) { $CachedAuthenticationMode = $Script:AuthorizationO365Cache.AuthenticationMode }
+            if ($Script:AuthorizationO365Cache.Contains('UserName')) { $CachedUserName = $Script:AuthorizationO365Cache.UserName }
+            if (-not $RequestedUseWam) {
+                $UseWam = $CachedAuthenticationMode -eq 'WAM'
+            }
+            if ($Script:AuthorizationO365Cache.Contains('PortalWebSession')) { $PortalWebSession = $Script:AuthorizationO365Cache.PortalWebSession }
+            if ($Script:AuthorizationO365Cache.Contains('AjaxSessionKey')) { $AjaxSessionKey = $Script:AuthorizationO365Cache.AjaxSessionKey }
+            if ($Script:AuthorizationO365Cache.Contains('PortalRouteKey')) { $PortalRouteKey = $Script:AuthorizationO365Cache.PortalRouteKey }
+            if ($Script:AuthorizationO365Cache.Contains('PortalUserId')) { $PortalUserId = $Script:AuthorizationO365Cache.PortalUserId }
+            if ($Script:AuthorizationO365Cache.Contains('PortalTenantId')) { $PortalTenantId = $Script:AuthorizationO365Cache.PortalTenantId }
+            if ($Script:AuthorizationO365Cache.Contains('HeadersPortal')) { $HeadersPortal = $Script:AuthorizationO365Cache.HeadersPortal }
+        }
+    }
+    $IsAppAuthentication = $PSCmdlet.ParameterSetName -eq 'App' -or ($ClientId -and ($ClientSecret -or $Certificate))
+    $GraphScopesToRequest = if ($IsAppAuthentication) {
+        @()
+    } else {
+        @(
+            foreach ($Scope in @($ExistingGraphScopes + $RequestedGraphScopes)) {
+                foreach ($Part in ($Scope -split '\s+')) {
+                    if (-not [string]::IsNullOrWhiteSpace($Part) -and $Part -notin 'offline_access', 'openid', 'profile', 'email') {
+                        $ConcreteScope = ($Part -split '\|' | Select-Object -First 1).Trim()
+                        if (-not [string]::IsNullOrWhiteSpace($ConcreteScope)) {
+                            $ConcreteScope
+                        }
+                    }
+                }
+            }
+        ) | Select-Object -Unique
+    }
+
+    if ($ExplicitCredential) {
+        $Credential = $ExplicitCredential
+    }
+
+    if ($HasPortalAttachInput -and -not $ForceRefresh) {
+        $CachedHeaders = if ($Headers) {
+            $Headers
+        } elseif ($Script:AuthorizationO365Cache) {
+            $Script:AuthorizationO365Cache
+        } else {
+            $null
+        }
+
+        if ($CachedHeaders -and $CachedHeaders.ExpiresOnUTC -gt [datetime]::UtcNow) {
+            $PortalParams = @{
+                Headers = $CachedHeaders
+            }
+            if ($UsePortalAttachWebSession) {
+                $PortalParams.WebSession = $PortalAttachWebSession
+            } elseif ($UsePortalAttachCookies) {
+                $PortalParams.RootAuthToken = $PortalAttachRootAuthToken
+                if (-not [string]::IsNullOrWhiteSpace($PortalAttachSPAAuthCookie)) {
+                    $PortalParams.SPAAuthCookie = $PortalAttachSPAAuthCookie
+                }
+                if (-not [string]::IsNullOrWhiteSpace($PortalAttachOIDCAuthCookie)) {
+                    $PortalParams.OIDCAuthCookie = $PortalAttachOIDCAuthCookie
+                }
+                if (-not [string]::IsNullOrWhiteSpace($PortalAttachAjaxSessionKey)) {
+                    $PortalParams.AjaxSessionKey = $PortalAttachAjaxSessionKey
+                }
+                if (-not [string]::IsNullOrWhiteSpace($PortalAttachSessionId)) {
+                    $PortalParams.SessionId = $PortalAttachSessionId
+                }
+                if (-not [string]::IsNullOrWhiteSpace($PortalAttachTenantId)) {
+                    $PortalParams.TenantId = $PortalAttachTenantId
+                }
+                if (-not [string]::IsNullOrWhiteSpace($PortalAttachRouteKey)) {
+                    $PortalParams.PortalRouteKey = $PortalAttachRouteKey
+                }
+                if (-not [string]::IsNullOrWhiteSpace($PortalAttachUserName)) {
+                    $PortalParams.Username = $PortalAttachUserName
+                }
+                if ($PortalAttachCookieMap) {
+                    $PortalParams.AdditionalCookies = $PortalAttachCookieMap
+                }
+            }
+            if ($SkipPortalBootstrap) {
+                $PortalParams.SkipBootstrap = $true
+            }
+
+            return Set-O365PortalSession @PortalParams
         }
     }
 
@@ -54,14 +235,45 @@ function Connect-O365Admin {
     }
 
     $Tenant = if ($Tenant) { $Tenant } else { 'organizations' }
+    $WamAuthorityTenant = if ($UseWam) { $Tenant } else { $null }
+    $ForceWamPrompt = $ForceRefresh -and -not $SuppressWamPrompt
     $ScopesO365 = 'https://admin.microsoft.com/.default offline_access'
+    # Admin and directory portal routes can require the Microsoft 365/Azure portal audience
+    $ResourceAzure = '74658136-14ec-4630-ad9b-26e160ff0fc6'
     # Use the management.azure.com resource for ARM token acquisition
-    $ScopesAzure = 'https://management.azure.com/.default offline_access'
-    $ScopesGraph = 'https://graph.microsoft.com/.default offline_access'
+    $ScopesARM = 'https://management.azure.com/.default offline_access'
+    $ScopesGraph = if ($GraphScopesToRequest.Count -gt 0) {
+        (@($GraphScopesToRequest) + 'offline_access' | Select-Object -Unique) -join ' '
+    } else {
+        'https://graph.microsoft.com/.default offline_access'
+    }
+    # Teams admin APIs on teams.microsoft.com expect a token for api.spaces.skype.com
+    $ScopesTeams = 'https://api.spaces.skype.com/.default offline_access'
+
+    if ($UseWam -and $Device) {
+        Write-Warning -Message 'Connect-O365Admin - The -Device switch is ignored with -UseWam. Use -Device without -UseWam for device-code OAuth.'
+    }
+
+    $WamLoginHint = $null
+    if ($UseWam) {
+        if ($ExplicitCredential -and -not [string]::IsNullOrWhiteSpace($ExplicitCredential.UserName)) {
+            $WamLoginHint = $ExplicitCredential.UserName
+        } elseif ($Credential -and -not [string]::IsNullOrWhiteSpace($Credential.UserName)) {
+            $WamLoginHint = $Credential.UserName
+        } elseif ($CachedAuthenticationMode -eq 'WAM' -and -not [string]::IsNullOrWhiteSpace($CachedUserName)) {
+            $WamLoginHint = $CachedUserName
+        }
+    }
 
     try {
         Write-Verbose -Message "Connect-O365Admin - Acquiring token for Graph"
-        if ($PSCmdlet.ParameterSetName -eq 'App') {
+        if ($UseWam) {
+            if ($GraphScopesToRequest.Count -gt 0) {
+                $tokenGraph = Get-O365BrokerAccessToken -Tenant $WamAuthorityTenant -Scope $ScopesGraph -Account $WamLoginHint -ForcePrompt:$ForceWamPrompt
+            } else {
+                $tokenGraph = Get-O365BrokerAccessToken -Tenant $WamAuthorityTenant -ResourceUrl 'https://graph.microsoft.com/' -Account $WamLoginHint -ForcePrompt:$ForceWamPrompt
+            }
+        } elseif ($IsAppAuthentication) {
             $tokenGraph = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesGraph -ClientId $ClientId -ClientSecret $ClientSecret -Certificate $Certificate -CertificatePassword $CertificatePassword
         } elseif ($RefreshToken -and -not $Credential -and -not $Device) {
             $tokenGraph = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesGraph -RefreshToken $RefreshToken
@@ -69,8 +281,19 @@ function Connect-O365Admin {
             $tokenGraph = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesGraph -Credential $Credential -Device:$Device
         }
     } catch {
-        Write-Warning -Message "Connect-O365Admin - Authentication failure for Graph. Error: $($_.Exception.Message)"
-        return
+        $CanRetryWithDevice = -not $Device -and -not $IsAppAuthentication -and $_.Exception.Message -match 'Failed to listen on prefix|localhost:8400'
+        if ($CanRetryWithDevice) {
+            Write-Verbose -Message "Connect-O365Admin - Interactive listener failed. Falling back to device code for Graph."
+            try {
+                $tokenGraph = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesGraph -Credential $Credential -Device
+            } catch {
+                Write-Warning -Message "Connect-O365Admin - Authentication failure for Graph after device fallback. Error: $($_.Exception.Message)"
+                return
+            }
+        } else {
+            Write-Warning -Message "Connect-O365Admin - Authentication failure for Graph. Error: $($_.Exception.Message)"
+            return
+        }
     }
 
     # Read tenant information from the token so subsequent requests use the correct tenant
@@ -79,32 +302,91 @@ function Connect-O365Admin {
     if (-not $PSBoundParameters.ContainsKey('Tenant') -or $Tenant -eq 'organizations') {
         $Tenant = $tenantInfo.tid
     }
-    $refresh = $tokenGraph.refresh_token
+    $refresh = if ($UseWam) { $null } else { $tokenGraph.refresh_token }
+    $WamAccount = if ($UseWam) { $tokenGraph.account } else { $null }
+    $graphTokenInfo = ConvertFrom-JSONWebToken -Token $tokenGraph.access_token
+    $GrantedGraphScopes = @()
+    if ($graphTokenInfo.scp) {
+        $GrantedGraphScopes = @($graphTokenInfo.scp -split '\s+' | Where-Object { $_ })
+    } elseif ($graphTokenInfo.roles) {
+        $GrantedGraphScopes = @($graphTokenInfo.roles)
+    } elseif ($tokenGraph.scopes) {
+        $GrantedGraphScopes = @($tokenGraph.scopes)
+    }
+    $tokenO365 = $null
+    $tokenAzure = $null
     try {
         Write-Verbose -Message "Connect-O365Admin - Acquiring token for admin.microsoft.com"
-        if ($PSCmdlet.ParameterSetName -eq 'App') {
+        if ($UseWam) {
+            $tokenO365 = Get-O365BrokerAccessToken -Tenant $WamAuthorityTenant -ResourceUrl 'https://admin.microsoft.com/' -Account $WamAccount
+        } elseif ($IsAppAuthentication) {
             $tokenO365 = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesO365 -ClientId $ClientId -ClientSecret $ClientSecret -Certificate $Certificate -CertificatePassword $CertificatePassword
         } else {
             $tokenO365 = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesO365 -RefreshToken $refresh
         }
     } catch {
-        Write-Warning -Message "Connect-O365Admin - Authentication failure for admin.microsoft.com. Error: $($_.Exception.Message)"
-        return
+        Write-Verbose -Message "Connect-O365Admin - admin.microsoft.com scope token failed. Falling back to portal resource audience. Error: $($_.Exception.Message)"
+        try {
+            if ($UseWam) {
+                $tokenO365 = Get-O365BrokerAccessToken -Tenant $WamAuthorityTenant -ResourceUrl $ResourceAzure -Account $WamAccount
+            } elseif ($IsAppAuthentication) {
+                $tokenO365 = Get-O365OAuthToken -Tenant $Tenant -Resource $ResourceAzure -ClientId $ClientId -ClientSecret $ClientSecret -Certificate $Certificate -CertificatePassword $CertificatePassword
+            } else {
+                $tokenO365 = Get-O365OAuthToken -Tenant $Tenant -Resource $ResourceAzure -RefreshToken $refresh
+            }
+            $tokenAzure = $tokenO365
+            Write-Verbose -Message "Connect-O365Admin - Using portal resource token for admin.microsoft.com routes"
+        } catch {
+            Write-Warning -Message "Connect-O365Admin - Authentication failure for admin.microsoft.com and portal resource fallback. Error: $($_.Exception.Message)"
+            return
+        }
     }
     try {
-        Write-Verbose -Message "Connect-O365Admin - Acquiring token for Azure"
-        if ($PSCmdlet.ParameterSetName -eq 'App') {
-            $tokenAzure = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesAzure -ClientId $ClientId -ClientSecret $ClientSecret -Certificate $Certificate -CertificatePassword $CertificatePassword
+        Write-Verbose -Message "Connect-O365Admin - Acquiring token for Teams (api.spaces.skype.com)"
+        if ($UseWam) {
+            $tokenTeams = Get-O365BrokerAccessToken -Tenant $WamAuthorityTenant -ResourceUrl 'https://api.spaces.skype.com/' -Account $WamAccount
+        } elseif ($IsAppAuthentication) {
+            $tokenTeams = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesTeams -ClientId $ClientId -ClientSecret $ClientSecret -Certificate $Certificate -CertificatePassword $CertificatePassword
         } else {
-            $tokenAzure = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesAzure -RefreshToken $refresh
+            $tokenTeams = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesTeams -RefreshToken $refresh
         }
     } catch {
-        Write-Warning -Message "Connect-O365Admin - Authentication failure for Azure. Error: $($_.Exception.Message)"
-        $tokenAzure = $null
+        Write-Warning -Message "Connect-O365Admin - Authentication failure for Teams (api.spaces.skype.com). Error: $($_.Exception.Message)"
+        $tokenTeams = $null
+    }
+    if (-not $tokenAzure) {
+        try {
+            Write-Verbose -Message "Connect-O365Admin - Acquiring token for Azure"
+            if ($UseWam) {
+                $tokenAzure = Get-O365BrokerAccessToken -Tenant $WamAuthorityTenant -ResourceUrl $ResourceAzure -Account $WamAccount
+            } elseif ($IsAppAuthentication) {
+                $tokenAzure = Get-O365OAuthToken -Tenant $Tenant -Resource $ResourceAzure -ClientId $ClientId -ClientSecret $ClientSecret -Certificate $Certificate -CertificatePassword $CertificatePassword
+            } else {
+                $tokenAzure = Get-O365OAuthToken -Tenant $Tenant -Resource $ResourceAzure -RefreshToken $refresh
+            }
+        } catch {
+            Write-Warning -Message "Connect-O365Admin - Authentication failure for Azure. Error: $($_.Exception.Message)"
+            $tokenAzure = $null
+        }
+    }
+    try {
+        Write-Verbose -Message "Connect-O365Admin - Acquiring token for Azure management"
+        if ($UseWam) {
+            $tokenARM = Get-O365BrokerAccessToken -Tenant $WamAuthorityTenant -ResourceUrl 'https://management.azure.com/' -Account $WamAccount
+        } elseif ($IsAppAuthentication) {
+            $tokenARM = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesARM -ClientId $ClientId -ClientSecret $ClientSecret -Certificate $Certificate -CertificatePassword $CertificatePassword
+        } else {
+            $tokenARM = Get-O365OAuthToken -Tenant $Tenant -Scope $ScopesARM -RefreshToken $refresh
+        }
+    } catch {
+        Write-Warning -Message "Connect-O365Admin - Authentication failure for Azure management. Error: $($_.Exception.Message)"
+        $tokenARM = $null
     }
 
-    if ($PSCmdlet.ParameterSetName -eq 'App') {
+    if ($IsAppAuthentication) {
         $userName = $ClientId
+    } elseif ($UseWam -and $tokenGraph.account) {
+        $userName = $tokenGraph.account
     } elseif ($Credential) {
         $userName = $Credential.UserName
     } else {
@@ -113,17 +395,24 @@ function Connect-O365Admin {
         $userName = if ($tokenInfo.preferred_username) { $tokenInfo.preferred_username } else { $tokenInfo.upn }
     }
 
+    $ExpiresOnUTC = if ($UseWam -and $tokenGraph.expires_on) {
+        ([datetime] $tokenGraph.expires_on).AddSeconds(-$ExpiresTimeout)
+    } else {
+        ([datetime]::UtcNow).AddSeconds($ExpiresIn - $ExpiresTimeout)
+    }
+
     $Script:AuthorizationO365Cache = [ordered] @{
         'Credential'          = $Credential
         'ClientId'            = $ClientId
         'ClientSecret'        = $ClientSecret
         'Certificate'         = $Certificate
         'CertificatePassword' = $CertificatePassword
+        'AuthenticationMode'   = if ($UseWam) { 'WAM' } else { 'OAuth' }
         'UserName'            = $userName
         'Environment'         = 'AzureCloud'
         'Subscription'        = $Subscription
         'Tenant'              = $Tenant
-        'ExpiresOnUTC'        = ([datetime]::UtcNow).AddSeconds($ExpiresIn - $ExpiresTimeout)
+        'ExpiresOnUTC'        = $ExpiresOnUTC
         'RefreshToken'        = $refresh
         'AccessTokenO365'     = $tokenO365.access_token
         'HeadersO365'         = [ordered] @{
@@ -145,7 +434,20 @@ function Connect-O365Admin {
         } else {
             $null
         }
+        'AccessTokenARM'      = if ($tokenARM) { $tokenARM.access_token } else { $null }
+        'HeadersARM'          = if ($tokenARM) {
+            [ordered] @{
+                'Content-Type'           = 'application/json; charset=UTF-8'
+                'Authorization'          = "Bearer $($tokenARM.access_token)"
+                'X-Requested-With'       = 'XMLHttpRequest'
+                'x-ms-client-request-id' = [guid]::NewGuid()
+                'x-ms-correlation-id'    = [guid]::NewGuid()
+            }
+        } else {
+            $null
+        }
         'AccessTokenGraph'    = $tokenGraph.access_token
+        'GraphScopes'         = $GrantedGraphScopes
         'HeadersGraph'        = [ordered] @{
             'Content-Type'           = 'application/json; charset=UTF-8'
             'Authorization'          = "Bearer $($tokenGraph.access_token)"
@@ -153,6 +455,70 @@ function Connect-O365Admin {
             'x-ms-client-request-id' = [guid]::NewGuid()
             'x-ms-correlation-id'    = [guid]::NewGuid()
         }
+        'AccessTokenTeams'    = if ($tokenTeams) { $tokenTeams.access_token } else { $null }
+        'HeadersTeams'        = if ($tokenTeams) {
+            [ordered] @{
+                'Content-Type'           = 'application/json; charset=UTF-8'
+                'Authorization'          = "Bearer $($tokenTeams.access_token)"
+                'X-Requested-With'       = 'XMLHttpRequest'
+                # Teams admin often validates origin/referer for CORS-like flows
+                'Origin'                 = 'https://admin.teams.microsoft.com'
+                'Referer'                = 'https://admin.teams.microsoft.com/'
+                'x-ts-usecache'          = 'false'
+                'x-serverrequestid'      = [guid]::NewGuid()
+                'x-ms-client-request-id' = [guid]::NewGuid()
+                'x-ms-correlation-id'    = [guid]::NewGuid()
+            }
+        } else {
+            $null
+        }
+        'PortalWebSession'     = $PortalWebSession
+        'AjaxSessionKey'       = $AjaxSessionKey
+        'PortalRouteKey'       = $PortalRouteKey
+        'PortalUserId'         = $PortalUserId
+        'PortalTenantId'       = $PortalTenantId
+        'HeadersPortal'        = $HeadersPortal
     }
+
+    if ($HasPortalAttachInput) {
+        $PortalParams = @{
+            Headers = $Script:AuthorizationO365Cache
+        }
+        if ($UsePortalAttachWebSession) {
+            $PortalParams.WebSession = $PortalAttachWebSession
+        } elseif ($UsePortalAttachCookies) {
+            $PortalParams.RootAuthToken = $PortalAttachRootAuthToken
+            if (-not [string]::IsNullOrWhiteSpace($PortalAttachSPAAuthCookie)) {
+                $PortalParams.SPAAuthCookie = $PortalAttachSPAAuthCookie
+            }
+            if (-not [string]::IsNullOrWhiteSpace($PortalAttachOIDCAuthCookie)) {
+                $PortalParams.OIDCAuthCookie = $PortalAttachOIDCAuthCookie
+            }
+            if (-not [string]::IsNullOrWhiteSpace($PortalAttachAjaxSessionKey)) {
+                $PortalParams.AjaxSessionKey = $PortalAttachAjaxSessionKey
+            }
+            if (-not [string]::IsNullOrWhiteSpace($PortalAttachSessionId)) {
+                $PortalParams.SessionId = $PortalAttachSessionId
+            }
+            if (-not [string]::IsNullOrWhiteSpace($PortalAttachTenantId)) {
+                $PortalParams.TenantId = $PortalAttachTenantId
+            }
+            if (-not [string]::IsNullOrWhiteSpace($PortalAttachRouteKey)) {
+                $PortalParams.PortalRouteKey = $PortalAttachRouteKey
+            }
+            if (-not [string]::IsNullOrWhiteSpace($PortalAttachUserName)) {
+                $PortalParams.Username = $PortalAttachUserName
+            }
+            if ($PortalAttachCookieMap) {
+                $PortalParams.AdditionalCookies = $PortalAttachCookieMap
+            }
+        }
+        if ($SkipPortalBootstrap) {
+            $PortalParams.SkipBootstrap = $true
+        }
+
+        return Set-O365PortalSession @PortalParams
+    }
+
     $Script:AuthorizationO365Cache
 }

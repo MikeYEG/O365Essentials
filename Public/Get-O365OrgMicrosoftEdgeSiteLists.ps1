@@ -1,23 +1,53 @@
-﻿function Get-O365OrgMicrosoftEdgeSiteLists {
+function Get-O365OrgMicrosoftEdgeSiteLists {
     <#
     .SYNOPSIS
-    Retrieves Microsoft Edge site lists for the organization.
+    Retrieves Microsoft Edge enterprise site list data for the organization.
 
     .DESCRIPTION
-    This function retrieves Microsoft Edge site lists for the organization from the specified API endpoint using the provided headers.
+    Reads the Microsoft Edge site list and notification payloads used by the
+    Microsoft 365 admin center.
 
     .PARAMETER Headers
-    A dictionary containing the necessary headers for the API request, typically including authorization information.
+    Optional authorization cache returned by Connect-O365Admin.
+
+    .PARAMETER Name
+    Selects which Microsoft Edge site list payload to return.
 
     .EXAMPLE
-    Get-O365OrgMicrosoftEdgeSiteLists -Headers $headers
+    Get-O365OrgMicrosoftEdgeSiteLists
+
+    .EXAMPLE
+    Get-O365OrgMicrosoftEdgeSiteLists -Name Notifications
     #>
     [cmdletbinding()]
     param(
-        [alias('Authorization')][System.Collections.IDictionary] $Headers
+        [alias('Authorization')][System.Collections.IDictionary] $Headers,
+        [ValidateSet('All', 'Notifications', 'SiteLists')][string] $Name = 'All'
     )
-    $Uri = 'https://admin.microsoft.com/fd/edgeenterprisesitemanagement/api/shard'
 
-    $Output = Invoke-O365Admin -Uri $Uri -Headers $Headers
-    $Output
+    $AdditionalHeaders = Get-O365PortalContextHeaders -Context MicrosoftEdge -PortalHost 'https://admin.cloud.microsoft' -AjaxSessionKey $Headers.AjaxSessionKey -PortalRouteKey $Headers.PortalRouteKey
+    $UsePortalSession = $false
+    if ($Headers) {
+        if ($Headers.Contains('AjaxSessionKey') -and -not [string]::IsNullOrWhiteSpace($Headers['AjaxSessionKey'])) {
+            $UsePortalSession = $true
+        }
+        elseif ($Headers.Contains('PortalWebSession') -and $null -ne $Headers['PortalWebSession']) {
+            $UsePortalSession = $true
+        }
+    }
+
+    if ($Name -eq 'All') {
+        [PSCustomObject] @{
+            SiteLists     = Get-O365OrgMicrosoftEdgeSiteLists -Headers $Headers -Name SiteLists
+            Notifications = Get-O365OrgMicrosoftEdgeSiteLists -Headers $Headers -Name Notifications
+        }
+        return
+    }
+
+    $Uri = switch ($Name) {
+        'SiteLists' { 'https://admin.cloud.microsoft/fd/edgeenterprisesitemanagement/api/v2/emiesitelists' }
+        'Notifications' { 'https://admin.cloud.microsoft/fd/edgeenterprisesitemanagement/api/v2/notifications' }
+    }
+
+    Get-EdgeSiteListSafeResult -ResultName $Name -ScriptBlock { Invoke-O365Admin -Uri $Uri -Headers $Headers -Method GET -AdditionalHeaders $AdditionalHeaders -UsePortalSession:$UsePortalSession -QuietOnError }
 }

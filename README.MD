@@ -1,7 +1,7 @@
 ﻿<p align="center">
   <a href="https://dev.azure.com/evotecpl/O365Essentials/_build/results?buildId=latest"><img src="https://dev.azure.com/evotecpl/O365Essentials/_apis/build/status/EvotecIT.O365Essentials"></a>
   <a href="https://www.powershellgallery.com/packages/O365Essentials"><img src="https://img.shields.io/powershellgallery/v/O365Essentials.svg"></a>
-  <a href="https://www.powershellgallery.com/packages/O365Essentials"><img src="https://img.shields.io/powershellgallery/vpre/O365Essentials.svg?label=powershell%20gallery%20preview&colorB=yellow"></a>
+  <a href="https://www.powershellgallery.com/packages/O365Essentials"><img src="https://img.shields.io/powershellgallery/v/O365Essentials.svg?label=powershell%20gallery%20preview&colorB=yellow&include_prereleases"></a>
   <a href="https://github.com/EvotecIT/O365Essentials"><img src="https://img.shields.io/github/license/EvotecIT/O365Essentials.svg"></a>
 </p>
 
@@ -76,6 +76,15 @@ If we have MFA we simply let it query you for MFA code.
 $null = Connect-O365Admin -Verbose
 ```
 
+On Windows PowerShell 7.4+, you can opt into the Web Account Manager broker
+through the bundled MSAL helper. This allows Windows Hello, Conditional Access,
+FIDO, and the Windows account picker to participate in delegated sign-in while
+the MSAL assemblies stay isolated inside the packaged module:
+
+```powershell
+$null = Connect-O365Admin -UseWam -Tenant 'contoso.onmicrosoft.com' -Verbose
+```
+
 We can also connect using an application registration with a client secret or certificate:
 
 ```powershell
@@ -97,6 +106,43 @@ When working with multiple tenants you can target a specific tenant using the `-
 ```powershell
 $null = Connect-O365Admin -Tenant 'contoso.onmicrosoft.com' -Verbose
 ```
+
+### Portal-backed routes for host apps
+
+Some newer internal `admin.cloud.microsoft` surfaces, especially parts of Copilot,
+Search, and Agents, may require a live admin portal session in addition to bearer
+tokens. End users should still use only `Connect-O365Admin`; the portal session is a
+host/app integration detail, not a second public connection workflow.
+
+For host applications that already capture browser session state from
+`https://admin.cloud.microsoft`, the hidden portal attachment contract is:
+
+* seed the current PowerShell **process** with either:
+  * `O365ESSENTIALS_PORTAL_CONTEXT_JSON`
+  * `O365ESSENTIALS_PORTAL_COOKIE_HEADER`
+  * `O365ESSENTIALS_PORTAL_COOKIE_LIST_JSON`
+  * or the expanded `O365ESSENTIALS_PORTAL_*` variables
+* then call `Connect-O365Admin` normally
+* `Connect-O365Admin` will consume that state, attach the portal replay session,
+  and clear the seeded values after use by default
+
+Minimum useful cookie seed:
+
+* `RootAuthToken`
+* at least one of `OIDCAuthCookie` or `SPAAuthCookie`
+
+Recommended additional values for better replay fidelity:
+
+* `s.AjaxSessionKey`
+* `s.SessID`
+* `s.UserTenantId`
+* `x-portal-routekey`
+* `s.userid`
+
+If a portal-sensitive route still hits HTTP `440`, `Invoke-O365Admin` now performs a
+one-time hidden retry against the attached portal session before returning a structured
+unavailable result. This keeps the user-facing workflow unchanged while allowing host
+applications to light up the more session-sensitive internal endpoints.
 
 ### Required permissions
 
